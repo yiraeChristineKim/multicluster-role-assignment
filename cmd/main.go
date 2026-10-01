@@ -28,11 +28,14 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"github.com/stolostron/multicluster-role-assignment/internal/controller"
+	"github.com/stolostron/multicluster-role-assignment/internal/utils"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 
+	configv1 "github.com/openshift/api/config/v1"
 	mrav1beta1 "github.com/stolostron/multicluster-role-assignment/api/v1beta1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -54,8 +57,11 @@ func init() {
 	utilruntime.Must(mrav1beta1.AddToScheme(scheme))
 	utilruntime.Must(clusterv1beta1.Install(scheme))
 	utilruntime.Must(cpv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(configv1.Install(scheme))
 	// +kubebuilder:scaffold:scheme
 }
+
+// +kubebuilder:rbac:groups=config.openshift.io,resources=apiservers,verbs=get;list;watch
 
 // nolint:gocyclo
 func main() {
@@ -106,6 +112,28 @@ func main() {
 		tlsOpts = append(tlsOpts, disableHTTP2)
 	}
 
+	// Honor the hub cluster's TLSSecurityProfile (min TLS version, cipher suites, and supported
+	// groups/CurvePreferences) for the metrics server, the only TLS-terminating endpoint this
+	// operator exposes. On non-OpenShift hubs, or if the profile can't be read for any reason, the
+	// default Intermediate profile is applied instead.
+	ctx := context.Background()
+
+	uncachedClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+	if err != nil {
+		setupLog.Error(err, "unable to create uncached client for hub TLS profile lookup")
+		os.Exit(1)
+	}
+
+	tlsProfile, err := utils.GetHubTLSSecurityProfile(ctx, uncachedClient)
+	if err != nil {
+		setupLog.Error(err, "unable to get hub TLSSecurityProfile, falling back to default Intermediate profile")
+		tlsProfile = utils.DefaultTLSSecurityProfile()
+	}
+
+	setupLog.Info("configuring metrics server TLS from hub TLSSecurityProfile",
+		"minTLSVersion", tlsProfile.MinTLSVersion, "cipherCount", len(tlsProfile.Ciphers), "groups", tlsProfile.Groups)
+	tlsOpts = append(tlsOpts, utils.ApplyTLSSecurityProfile(tlsProfile))
+
 	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
 	// More info:
 	// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/metrics/server
@@ -150,7 +178,7 @@ func main() {
 		os.Exit(1)
 	}
 	// Setup field indexes for efficient lookups (e.g., MRAs by Placement reference)
-	if err := controller.SetupIndexes(context.Background(), mgr); err != nil {
+	if err := controller.SetupIndexes(ctx, mgr); err != nil {
 		setupLog.Error(err, "unable to setup field indexes")
 		os.Exit(1)
 	}
