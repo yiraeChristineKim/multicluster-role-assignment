@@ -62,6 +62,31 @@ func TestHubAPIServerTLSProfileWatcher_ReconcileOnProfileChange(t *testing.T) {
 	}
 }
 
+func TestHubAPIServerTLSProfileWatcher_ReconcileOnAPIServerDeletion(t *testing.T) {
+	scheme := newSchemeWithConfigV1(t)
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	applied := CopyTLSSecurityProfileSpec(configv1.TLSProfiles[configv1.TLSProfileModernType])
+
+	changed := false
+	watcher := &HubAPIServerTLSProfileWatcher{
+		Client:         cl,
+		appliedProfile: applied,
+		onProfileChange: func(_ context.Context, _, _ configv1.TLSProfileSpec) {
+			changed = true
+		},
+	}
+
+	_, err := watcher.Reconcile(context.Background(), reconcile.Request{NamespacedName: ctrlclient.ObjectKey{Name: hubAPIServerName}})
+	if err != nil {
+		t.Fatalf("Reconcile() error: %v", err)
+	}
+
+	if !changed {
+		t.Fatal("expected onProfileChange when APIServer is deleted and applied profile is not Intermediate")
+	}
+}
+
 func TestHubAPIServerTLSProfileWatcher_ReconcileIgnoresUnrelatedAPIServer(t *testing.T) {
 	scheme := newSchemeWithConfigV1(t)
 	cl := fake.NewClientBuilder().WithScheme(scheme).Build()

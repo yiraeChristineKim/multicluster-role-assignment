@@ -227,7 +227,7 @@ func ApplyTLSSecurityProfile(profile *configv1.TLSProfileSpec) func(*tls.Config)
 
 		// TLS 1.3 cipher suites aren't configurable in Go and are always enabled when TLS 1.3 is
 		// negotiated, so only apply the configured cipher suites when TLS 1.2 (or lower) may be used.
-		if minVersion < tls.VersionTLS13 && len(cipherSuites) > 0 {
+		if minVersion < tls.VersionTLS13 {
 			c.CipherSuites = cipherSuites
 		}
 

@@ -23,9 +23,11 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -73,6 +75,7 @@ func SetupHubAPIServerTLSProfileWatcher(
 	return builder.ControllerManagedBy(mgr).
 		For(&configv1.APIServer{}).
 		WithEventFilter(clusterAPIServerPredicate).
+		WithOptions(controller.Options{NeedLeaderElection: ptr.To(false)}).
 		Complete(watcher)
 }
 
@@ -89,15 +92,17 @@ func (w *HubAPIServerTLSProfileWatcher) Reconcile(ctx context.Context, req recon
 	logger := log.FromContext(ctx)
 
 	apiServer := &configv1.APIServer{}
+	var current *configv1.TLSProfileSpec
+
 	if err := w.Get(ctx, types.NamespacedName{Name: hubAPIServerName}, apiServer); err != nil {
 		if apierrors.IsNotFound(err) {
-			return reconcile.Result{}, nil
+			current = DefaultTLSSecurityProfile()
+		} else {
+			return reconcile.Result{}, err
 		}
-
-		return reconcile.Result{}, err
+	} else {
+		current = ResolveTLSSecurityProfile(apiServer)
 	}
-
-	current := ResolveTLSSecurityProfile(apiServer)
 	if TLSSecurityProfileSpecsEqual(&w.appliedProfile, current) {
 		return reconcile.Result{}, nil
 	}

@@ -103,7 +103,7 @@ func TestGetHubTLSSecurityProfile(t *testing.T) {
 						Custom: &configv1.CustomTLSProfile{
 							TLSProfileSpec: configv1.TLSProfileSpec{
 								MinTLSVersion: configv1.VersionTLS12,
-								Ciphers:       []string{"ECDHE-RSA-AES128-GCM-SHA256"},
+								Ciphers:       []string{opensslCipherECDHERSAAES128GCM},
 								Groups:        []configv1.TLSGroup{configv1.TLSGroupX25519, configv1.TLSGroupSecP256r1},
 							},
 						},
@@ -112,7 +112,7 @@ func TestGetHubTLSSecurityProfile(t *testing.T) {
 			},
 			expected: &configv1.TLSProfileSpec{
 				MinTLSVersion: configv1.VersionTLS12,
-				Ciphers:       []string{"ECDHE-RSA-AES128-GCM-SHA256"},
+				Ciphers:       []string{opensslCipherECDHERSAAES128GCM},
 				Groups:        []configv1.TLSGroup{configv1.TLSGroupX25519, configv1.TLSGroupSecP256r1},
 			},
 		},
@@ -283,7 +283,7 @@ func TestConvertCipherSuites(t *testing.T) {
 	}{
 		{
 			name:     "known OpenSSL cipher names convert to crypto/tls constants",
-			ciphers:  []string{"ECDHE-RSA-AES128-GCM-SHA256", "AES128-SHA"},
+			ciphers:  []string{opensslCipherECDHERSAAES128GCM, "AES128-SHA"},
 			expected: []uint16{tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, tls.TLS_RSA_WITH_AES_128_CBC_SHA},
 		},
 		{
@@ -367,7 +367,7 @@ func TestApplyTLSSecurityProfile(t *testing.T) {
 	t.Run("TLS 1.2 profile applies MinVersion, CipherSuites, and CurvePreferences", func(t *testing.T) {
 		profile := &configv1.TLSProfileSpec{
 			MinTLSVersion: configv1.VersionTLS12,
-			Ciphers:       []string{"ECDHE-RSA-AES128-GCM-SHA256"},
+			Ciphers:       []string{opensslCipherECDHERSAAES128GCM},
 			Groups:        []configv1.TLSGroup{configv1.TLSGroupX25519},
 		}
 
@@ -407,6 +407,24 @@ func TestApplyTLSSecurityProfile(t *testing.T) {
 
 		if len(cfg.CurvePreferences) != 1 || cfg.CurvePreferences[0] != tls.CurveP384 {
 			t.Errorf("CurvePreferences = %v, expected [%v]", cfg.CurvePreferences, tls.CurveP384)
+		}
+	})
+
+	t.Run("TLS 1.2 profile with no convertible ciphers sets empty CipherSuites", func(t *testing.T) {
+		profile := &configv1.TLSProfileSpec{
+			MinTLSVersion: configv1.VersionTLS12,
+			Ciphers:       []string{"TLS_AES_128_GCM_SHA256"},
+		}
+
+		cfg := &tls.Config{}
+		ApplyTLSSecurityProfile(profile)(cfg)
+
+		if cfg.CipherSuites == nil {
+			t.Fatal("CipherSuites should be a non-nil empty slice to disable default TLS 1.2 suites")
+		}
+
+		if len(cfg.CipherSuites) != 0 {
+			t.Fatalf("CipherSuites = %v, expected empty slice", cfg.CipherSuites)
 		}
 	})
 

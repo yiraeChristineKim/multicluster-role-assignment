@@ -127,7 +127,9 @@ func main() {
 		stop()
 	}()
 
-	uncachedClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+	hubTLSConfig := ctrl.GetConfigOrDie()
+	hubTLSConfig.Timeout = 10 * time.Second
+	uncachedClient, err := client.New(hubTLSConfig, client.Options{Scheme: scheme})
 	if err != nil {
 		setupLog.Error(err, "unable to create uncached client for hub TLS profile lookup")
 		os.Exit(1)
