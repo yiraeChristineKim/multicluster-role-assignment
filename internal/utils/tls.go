@@ -20,11 +20,13 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"time"
 
 	configv1 "github.com/openshift/api/config/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -42,6 +44,17 @@ func DefaultTLSSecurityProfile() *configv1.TLSProfileSpec {
 // APIServer resource (config.openshift.io/v1, name "cluster"). On non-OpenShift hubs (or any hub where
 // the APIServer resource/CRD can't be found) it returns the DefaultTLSSecurityProfile instead of an
 // error, since there is nothing cluster-level to honor in that case.
+// hubTLSProfileReadBackoff is used when reading the hub APIServer TLS profile at startup.
+var hubTLSProfileReadBackoff = wait.Backoff{
+	Duration: time.Second,
+	Factor:   2.0,
+	Jitter:   0.1,
+	Steps:    5,
+	Cap:      30 * time.Second,
+}
+
+// GetHubTLSSecurityProfile resolves the hub TLSSecurityProfile from the APIServer resource. Transient
+// or permission errors are returned to the caller; only a missing APIServer CRD/resource uses the default.
 func GetHubTLSSecurityProfile(ctx context.Context, cl client.Client) (*configv1.TLSProfileSpec, error) {
 	apiServer := &configv1.APIServer{}
 
@@ -56,22 +69,56 @@ func GetHubTLSSecurityProfile(ctx context.Context, cl client.Client) (*configv1.
 		return nil, fmt.Errorf("failed to get hub APIServer resource %q: %w", hubAPIServerName, err)
 	}
 
+	return ResolveTLSSecurityProfile(apiServer), nil
+}
+
+// GetHubTLSSecurityProfileWithRetry reads the hub profile with exponential backoff. Use at startup
+// when a misconfigured RBAC or temporary API failure must not silently fall back to Intermediate.
+func GetHubTLSSecurityProfileWithRetry(ctx context.Context, cl client.Client) (*configv1.TLSProfileSpec, error) {
+	var profile *configv1.TLSProfileSpec
+
+	err := wait.ExponentialBackoffWithContext(ctx, hubTLSProfileReadBackoff, func(ctx context.Context) (bool, error) {
+		p, err := GetHubTLSSecurityProfile(ctx, cl)
+		if err != nil {
+			return false, nil
+		}
+
+		profile = p
+		return true, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("timed out reading hub APIServer TLS profile: %w", err)
+	}
+
+	if profile == nil {
+		return nil, fmt.Errorf("hub APIServer TLS profile read succeeded but returned no profile")
+	}
+
+	return profile, nil
+}
+
+// ResolveTLSSecurityProfile returns the effective TLSProfileSpec from an APIServer object.
+func ResolveTLSSecurityProfile(apiServer *configv1.APIServer) *configv1.TLSProfileSpec {
+	if apiServer == nil {
+		return DefaultTLSSecurityProfile()
+	}
+
 	profile := apiServer.Spec.TLSSecurityProfile
 	if profile == nil {
-		return DefaultTLSSecurityProfile(), nil
+		return DefaultTLSSecurityProfile()
 	}
 
 	// Predefined profiles (Old, Intermediate, Modern) are looked up from the well-known map.
 	if profileSpec, ok := configv1.TLSProfiles[profile.Type]; ok {
-		return profileSpec, nil
+		return profileSpec
 	}
 
 	// Custom profiles carry their own inline spec.
 	if profile.Type == configv1.TLSProfileCustomType && profile.Custom != nil {
-		return &profile.Custom.TLSProfileSpec, nil
+		return &profile.Custom.TLSProfileSpec
 	}
 
-	return DefaultTLSSecurityProfile(), nil
+	return DefaultTLSSecurityProfile()
 }
 
 // tlsVersionByProfileVersion maps OpenShift's TLSProtocolVersion to crypto/tls's numeric version constants.
@@ -95,25 +142,34 @@ func ConvertTLSVersion(version configv1.TLSProtocolVersion) uint16 {
 // cipherSuiteByOpenSSLName maps OpenShift's OpenSSL-formatted cipher suite names to crypto/tls's
 // numeric cipher suite constants. Only ciphers supported by Go's crypto/tls package are included;
 // TLS 1.3 cipher suites are not configurable in Go and are intentionally omitted.
+const (
+	opensslCipherECDHEECDSAAES128GCM = "ECDHE-ECDSA-AES128-GCM-SHA256"
+	opensslCipherECDHERSAAES128GCM   = "ECDHE-RSA-AES128-GCM-SHA256"
+	opensslCipherECDHEECDSAAES256GCM = "ECDHE-ECDSA-AES256-GCM-SHA384"
+	opensslCipherECDHERSAAES256GCM   = "ECDHE-RSA-AES256-GCM-SHA384"
+	opensslCipherECDHEECDSAChaCha    = "ECDHE-ECDSA-CHACHA20-POLY1305"
+	opensslCipherECDHERSAChaCha      = "ECDHE-RSA-CHACHA20-POLY1305"
+)
+
 var cipherSuiteByOpenSSLName = map[string]uint16{
-	"ECDHE-ECDSA-AES128-GCM-SHA256": tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-	"ECDHE-RSA-AES128-GCM-SHA256":   tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-	"ECDHE-ECDSA-AES256-GCM-SHA384": tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-	"ECDHE-RSA-AES256-GCM-SHA384":   tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-	"ECDHE-ECDSA-CHACHA20-POLY1305": tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-	"ECDHE-RSA-CHACHA20-POLY1305":   tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-	"ECDHE-ECDSA-AES128-SHA256":     tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
-	"ECDHE-RSA-AES128-SHA256":       tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
-	"ECDHE-ECDSA-AES128-SHA":        tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-	"ECDHE-RSA-AES128-SHA":          tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-	"ECDHE-ECDSA-AES256-SHA":        tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-	"ECDHE-RSA-AES256-SHA":          tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-	"AES128-GCM-SHA256":             tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-	"AES256-GCM-SHA384":             tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-	"AES128-SHA256":                 tls.TLS_RSA_WITH_AES_128_CBC_SHA256,
-	"AES128-SHA":                    tls.TLS_RSA_WITH_AES_128_CBC_SHA,
-	"AES256-SHA":                    tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-	"DES-CBC3-SHA":                  tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA, //nolint:staticcheck // allow legacy cipher mapping
+	opensslCipherECDHEECDSAAES128GCM: tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+	opensslCipherECDHERSAAES128GCM:   tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+	opensslCipherECDHEECDSAAES256GCM: tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+	opensslCipherECDHERSAAES256GCM:   tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+	opensslCipherECDHEECDSAChaCha:    tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+	opensslCipherECDHERSAChaCha:      tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+	"ECDHE-ECDSA-AES128-SHA256":      tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+	"ECDHE-RSA-AES128-SHA256":        tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+	"ECDHE-ECDSA-AES128-SHA":         tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+	"ECDHE-RSA-AES128-SHA":           tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+	"ECDHE-ECDSA-AES256-SHA":         tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+	"ECDHE-RSA-AES256-SHA":           tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+	"AES128-GCM-SHA256":              tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+	"AES256-GCM-SHA384":              tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+	"AES128-SHA256":                  tls.TLS_RSA_WITH_AES_128_CBC_SHA256,
+	"AES128-SHA":                     tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+	"AES256-SHA":                     tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+	"DES-CBC3-SHA":                   tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA, //nolint:staticcheck // allow legacy cipher mapping
 }
 
 // ConvertCipherSuites converts OpenShift's OpenSSL-formatted cipher suite names into crypto/tls's

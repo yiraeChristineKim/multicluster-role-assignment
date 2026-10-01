@@ -19,11 +19,16 @@ package utils
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"testing"
+	"time"
 
 	configv1 "github.com/openshift/api/config/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -153,6 +158,97 @@ func TestGetHubTLSSecurityProfile(t *testing.T) {
 				t.Errorf("Groups = %v, expected %v", got.Groups, tt.expected.Groups)
 			}
 		})
+	}
+}
+
+type denyAPIServerGetClient struct {
+	ctrlclient.Client
+}
+
+func (d *denyAPIServerGetClient) Get(
+	_ context.Context,
+	key types.NamespacedName,
+	_ ctrlclient.Object,
+	_ ...ctrlclient.GetOption,
+) error {
+	if key.Name == hubAPIServerName {
+		return apierrors.NewForbidden(configv1.Resource("apiservers"), key.Name, errors.New("denied"))
+	}
+
+	return d.Client.Get(context.Background(), key, nil)
+}
+
+func TestGetHubTLSSecurityProfile_forbiddenReturnsError(t *testing.T) {
+	scheme := newSchemeWithConfigV1(t)
+	base := fake.NewClientBuilder().WithScheme(scheme).Build()
+	cl := &denyAPIServerGetClient{Client: base}
+
+	_, err := GetHubTLSSecurityProfile(context.Background(), cl)
+	if err == nil {
+		t.Fatal("expected error when APIServer get is forbidden")
+	}
+}
+
+type flakyAPIServerGetClient struct {
+	ctrlclient.Client
+
+	apiServer *configv1.APIServer
+	attempts  int
+}
+
+func (f *flakyAPIServerGetClient) Get(
+	ctx context.Context,
+	key types.NamespacedName,
+	obj ctrlclient.Object,
+	opts ...ctrlclient.GetOption,
+) error {
+	if key.Name != hubAPIServerName {
+		return f.Client.Get(ctx, key, obj, opts...)
+	}
+
+	f.attempts++
+	if f.attempts == 1 {
+		return apierrors.NewServiceUnavailable("temporary")
+	}
+
+	apiServer, ok := obj.(*configv1.APIServer)
+	if !ok {
+		return errors.New("unexpected object type")
+	}
+
+	f.apiServer.DeepCopyInto(apiServer)
+	return nil
+}
+
+func TestGetHubTLSSecurityProfileWithRetry_succeedsAfterTransientFailure(t *testing.T) {
+	scheme := newSchemeWithConfigV1(t)
+	apiServer := &configv1.APIServer{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+		Spec: configv1.APIServerSpec{
+			TLSSecurityProfile: &configv1.TLSSecurityProfile{
+				Type: configv1.TLSProfileModernType,
+			},
+		},
+	}
+
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(apiServer).Build()
+	cl := &flakyAPIServerGetClient{Client: base, apiServer: apiServer}
+
+	origBackoff := hubTLSProfileReadBackoff
+	hubTLSProfileReadBackoff = wait.Backoff{Duration: time.Millisecond, Factor: 1, Steps: 3}
+	defer func() { hubTLSProfileReadBackoff = origBackoff }()
+
+	got, err := GetHubTLSSecurityProfileWithRetry(context.Background(), cl)
+	if err != nil {
+		t.Fatalf("GetHubTLSSecurityProfileWithRetry() error: %v", err)
+	}
+
+	if got.MinTLSVersion != configv1.VersionTLS13 {
+		t.Fatalf("expected Modern profile TLS 1.3, got %v", got.MinTLSVersion)
+	}
+
+	if cl.attempts < 2 {
+		t.Fatalf("expected at least two get attempts, got %d", cl.attempts)
 	}
 }
 

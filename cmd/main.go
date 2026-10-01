@@ -29,7 +29,9 @@ import (
 
 	"github.com/stolostron/multicluster-role-assignment/internal/controller"
 	"github.com/stolostron/multicluster-role-assignment/internal/utils"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -73,6 +75,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var disableTLSProfileWatcher bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or leave as 0 to disable the metrics service.")
@@ -89,6 +92,8 @@ func main() {
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false, "If set, HTTP/2 will be enabled for the metrics server")
+	flag.BoolVar(&disableTLSProfileWatcher, "disable-tls-profile-watcher", false,
+		"Disable watching the hub APIServer TLSSecurityProfile for changes (local development only).")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -112,11 +117,15 @@ func main() {
 		tlsOpts = append(tlsOpts, disableHTTP2)
 	}
 
-	// Honor the hub cluster's TLSSecurityProfile (min TLS version, cipher suites, and supported
-	// groups/CurvePreferences) for the metrics server, the only TLS-terminating endpoint this
-	// operator exposes. On non-OpenShift hubs, or if the profile can't be read for any reason, the
-	// default Intermediate profile is applied instead.
-	ctx := context.Background()
+	// Honor the hub cluster's TLSSecurityProfile for the metrics server (the only TLS terminator).
+	// Profile changes are picked up by a watch that cancels the manager so the pod restarts.
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+
+	go func() {
+		<-ctrl.SetupSignalHandler().Done()
+		stop()
+	}()
 
 	uncachedClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
 	if err != nil {
@@ -124,15 +133,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	tlsProfile, err := utils.GetHubTLSSecurityProfile(ctx, uncachedClient)
+	tlsProfile, err := utils.GetHubTLSSecurityProfileWithRetry(ctx, uncachedClient)
 	if err != nil {
-		setupLog.Error(err, "unable to get hub TLSSecurityProfile, falling back to default Intermediate profile")
-		tlsProfile = utils.DefaultTLSSecurityProfile()
+		setupLog.Error(err, "unable to get hub TLSSecurityProfile after retries")
+		os.Exit(1)
 	}
 
+	appliedTLSProfile := utils.CopyTLSSecurityProfileSpec(tlsProfile)
+
 	setupLog.Info("configuring metrics server TLS from hub TLSSecurityProfile",
-		"minTLSVersion", tlsProfile.MinTLSVersion, "cipherCount", len(tlsProfile.Ciphers), "groups", tlsProfile.Groups)
-	tlsOpts = append(tlsOpts, utils.ApplyTLSSecurityProfile(tlsProfile))
+		"minTLSVersion", appliedTLSProfile.MinTLSVersion,
+		"cipherCount", len(appliedTLSProfile.Ciphers),
+		"groups", appliedTLSProfile.Groups)
+	tlsOpts = append(tlsOpts, utils.ApplyTLSSecurityProfile(&appliedTLSProfile))
 
 	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
 	// More info:
@@ -201,8 +214,36 @@ func main() {
 		os.Exit(1)
 	}
 
+	if !disableTLSProfileWatcher {
+		apiServerGVK := configv1.GroupVersion.WithKind("APIServer")
+		if _, err := mgr.GetRESTMapper().RESTMapping(
+			schema.GroupKind{Group: apiServerGVK.Group, Kind: apiServerGVK.Kind},
+			apiServerGVK.Version,
+		); err != nil {
+			if meta.IsNoMatchError(err) {
+				setupLog.Info("APIServer CRD not available, skipping TLS profile watcher")
+			} else {
+				setupLog.Error(err, "unable to map APIServer kind for TLS profile watcher")
+				os.Exit(1)
+			}
+		} else {
+			err = utils.SetupHubAPIServerTLSProfileWatcher(mgr, appliedTLSProfile, func(
+				_ context.Context, oldProfile, newProfile configv1.TLSProfileSpec,
+			) {
+				setupLog.Info("hub TLSSecurityProfile changed, shutting down to reload metrics server TLS",
+					"oldMinTLSVersion", oldProfile.MinTLSVersion,
+					"newMinTLSVersion", newProfile.MinTLSVersion)
+				stop()
+			})
+			if err != nil {
+				setupLog.Error(err, "unable to set up TLS profile watcher")
+				os.Exit(1)
+			}
+		}
+	}
+
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
